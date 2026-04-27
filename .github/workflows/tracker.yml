@@ -2,7 +2,7 @@ name: Cocoon Promo Tracker
 
 on:
   schedule:
-    - cron: "0 */6 * * *"  # every 6 hours
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
@@ -12,6 +12,12 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
+
+      - name: Restore last promo
+        uses: actions/cache@v3
+        with:
+          path: last_promo.txt
+          key: promo-cache
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -25,3 +31,9 @@ jobs:
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: python tracker.py
+
+      - name: Save last promo
+        uses: actions/cache@v3
+        with:
+          path: last_promo.txt
+          key: promo-cache
