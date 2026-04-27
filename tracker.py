@@ -1,14 +1,19 @@
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
 import os
+import re
+from datetime import datetime
 
 URL = "https://www.cocoonbysealy.com/"
 WEBHOOK = os.environ.get("WEBHOOK_URL")
 
+LAST_FILE = "last_promo.txt"
+
+
 def send(msg):
     if WEBHOOK:
         requests.post(WEBHOOK, json={"content": msg})
+
 
 def fetch_promo():
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -21,6 +26,24 @@ def fetch_promo():
 
     return hero.get_text(" ", strip=True)
 
+
+def extract_end_phrase(text):
+    match = re.search(r"ends\s+\w+", text.lower())
+    return match.group(0) if match else "no end date found"
+
+
+def load_last():
+    if os.path.exists(LAST_FILE):
+        with open(LAST_FILE, "r") as f:
+            return f.read().strip()
+    return None
+
+
+def save_current(promo):
+    with open(LAST_FILE, "w") as f:
+        f.write(promo)
+
+
 def main():
     promo = fetch_promo()
 
@@ -28,16 +51,25 @@ def main():
         send("⚠️ Could not find promo section")
         return
 
-    promo_lower = promo.lower()
+    last_promo = load_last()
 
     print("Current promo:", promo)
 
-    # 🔥 Detect Visa promo
-    if "visa" in promo_lower and "gift card" in promo_lower:
-        send("🚨 VISA GIFT CARD PROMO LIVE 🚨\n" + promo)
+    # 🔁 Only act if promo changed
+    if promo != last_promo:
+        end_info = extract_end_phrase(promo)
 
-    # Optional: always log promo
-    send("ℹ️ Current promo:\n" + promo)
+        message = f"🔄 Promo changed:\n{promo}\n\n📅 {end_info}"
+
+        send(message)
+
+        # 🔥 Visa detection
+        if "visa" in promo.lower() and "gift card" in promo.lower():
+            send("🚨 VISA GIFT CARD PROMO LIVE 🚨")
+
+        save_current(promo)
+    else:
+        print("No change. Skipping notification.")
 
 
 if __name__ == "__main__":
