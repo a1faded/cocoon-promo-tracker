@@ -2,38 +2,53 @@ name: Cocoon Promo Tracker
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
 
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
       - name: Restore last promo
-        uses: actions/cache@v3
+        uses: actions/cache/restore@v5
         with:
           path: last_promo.txt
-          key: promo-cache
+          key: promo-cache-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            promo-cache-
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run script
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run tracker
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: python tracker.py
 
+      - name: Ensure state file exists
+        if: always()
+        run: test -f last_promo.txt || touch last_promo.txt
+
       - name: Save last promo
-        uses: actions/cache@v3
+        if: always()
+        uses: actions/cache/save@v5
         with:
           path: last_promo.txt
-          key: promo-cache
+          key: promo-cache-${{ github.run_id }}-${{ github.run_attempt }}
