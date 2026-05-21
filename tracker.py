@@ -1,42 +1,81 @@
 import os
 import re
 import time
-import json
-import html as html_lib
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 URL = "https://www.cocoonbysealy.com/"
 WEBHOOK = os.environ.get("WEBHOOK_URL")
 LAST_FILE = "last_promo.txt"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/147.0.0.0 Safari/537.36"
+)
 
 
+# -------------------------
+# DISCORD
+# -------------------------
 def send(msg):
-    if WEBHOOK:
-        try:
-            requests.post(WEBHOOK, json={"content": msg[:1900]}, timeout=20)
-        except Exception as e:
-            print("Discord send failed:", e)
+    if not WEBHOOK:
+        print("WEBHOOK_URL missing. Message would have been:")
+        print(msg)
+        return
+
+    try:
+        requests.post(WEBHOOK, json={"content": msg[:1900]}, timeout=20)
+    except Exception as e:
+        print("Discord send failed:", e)
 
 
+# -------------------------
+# TEXT HELPERS
+# -------------------------
 def normalize(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def get_page():
-    r = requests.get(URL, headers=HEADERS, timeout=30)
-    return r.status_code, r.text
+def is_challenge_page(page_html):
+    t = (page_html or "").lower()
+    challenge_signals = [
+        "awswaf",
+        "gokuprops",
+        "window.gokuprops",
+        "challenge.js",
+        "captcha",
+        "recaptcha",
+        "access denied",
+    ]
+    return any(signal in t for signal in challenge_signals)
 
 
+def is_likely_promo(text):
+    t = text.lower()
+    promo_words = [
+        "save",
+        "sale",
+        "ends",
+        "mattress",
+        "mattresses",
+        "gift",
+        "card",
+        "visa",
+        "bundle",
+        "off",
+        "prepaid",
+        "reward",
+        "bonus",
+    ]
+    return sum(1 for word in promo_words if word in t) >= 2
+
+
+# -------------------------
+# PROMO EXTRACTION
+# -------------------------
 def extract_from_html(page_html):
     soup = BeautifulSoup(page_html, "html.parser")
 
@@ -46,91 +85,141 @@ def extract_from_html(page_html):
         ".home-oct16-hero__description",
         ".home-oct16-hero__copy",
         ".hero.home-oct16-hero",
-        ".promo-condtional-block .banner-block",
-        ".promo-conditional-block .banner-block",
     ]
 
     candidates = []
 
-    for sel in selectors:
-        for el in soup.select(sel):
+    for selector in selectors:
+        for el in soup.select(selector):
             text = normalize(el.get_text(" ", strip=True))
-            if is_likely_promo(text):
+            if text and is_likely_promo(text):
                 candidates.append(text)
 
-    # Fallback: promo callout spans near promo copy
+    # Fallback: promo callout span, usually the "Ends Today / Ends Monday" text
     for el in soup.select(".promo_callout_RTF"):
-        parent_text = normalize(el.find_parent().get_text(" ", strip=True) if el.find_parent() else el.get_text(" ", strip=True))
-        if parent_text:
-            candidates.append(parent_text)
+        parent = el.find_parent()
+        text = normalize(parent.get_text(" ", strip=True) if parent else el.get_text(" ", strip=True))
+        if text and is_likely_promo(text):
+            candidates.append(text)
 
-    # Fallback: settings JSON sometimes contains primary_promo_callout_message
-    raw = page_html
-    m = re.search(r'"primary_promo_callout_message"\s*:\s*"([^"]*)"', raw)
-    if m:
-        candidates.append(normalize(html_lib.unescape(m.group(1))))
+    # Regex fallback if classes change but copy is still in the page
+    raw_text = normalize(soup.get_text(" ", strip=True))
+    regex_patterns = [
+        r"((?:memorial day|weekend|super|summer|flash|holiday)?\s*sale.{0,220}?(?:save|get|receive).{0,220}?(?:mattress|mattresses|visa|gift card|prepaid card))",
+        r"((?:save|get|receive).{0,220}?(?:mattress|mattresses|visa|gift card|prepaid card).{0,120}?(?:ends\s+\w+)?)",
+    ]
 
-    # Fallback: regex around mattress sale text
-    m2 = re.search(
-        r"(?:Memorial Day sale|weekend super sale|sale).{0,250}?(?:Save\s+\d+%[^<]{0,100}Mattress[^<]{0,100})",
-        raw,
-        flags=re.I | re.S,
-    )
-    if m2:
-        cleaned = BeautifulSoup(m2.group(0), "html.parser").get_text(" ", strip=True)
-        candidates.append(normalize(cleaned))
+    for pattern in regex_patterns:
+        match = re.search(pattern, raw_text, flags=re.IGNORECASE)
+        if match:
+            text = normalize(match.group(1))
+            if text and is_likely_promo(text):
+                candidates.append(text)
 
-    # Prefer richest candidate
-    candidates = [c for c in candidates if c and len(c) > 8]
+    candidates = [c for c in candidates if c and len(c) > 10]
     candidates = list(dict.fromkeys(candidates))
 
-    if candidates:
-        return max(candidates, key=len)
+    if not candidates:
+        return None
 
-    return None
+    return max(candidates, key=len)
 
 
-def is_likely_promo(text):
-    t = text.lower()
-    promo_words = ["save", "sale", "ends", "mattress", "gift", "card", "visa", "bundle", "off"]
-    return sum(1 for w in promo_words if w in t) >= 2
+# -------------------------
+# BROWSER FETCH
+# -------------------------
+def browser_fetch_once():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1440, "height": 1200},
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+
+        page = context.new_page()
+
+        status = "unknown"
+        final_html = ""
+
+        try:
+            response = page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+            if response:
+                status = response.status
+
+            # Give WAF / JS hydration time to settle
+            page.wait_for_timeout(10000)
+
+            for cycle in range(4):
+                final_html = page.content()
+                promo = extract_from_html(final_html)
+
+                print(f"Browser cycle {cycle + 1} status:", status)
+                print(f"Browser cycle {cycle + 1} challenge:", is_challenge_page(final_html))
+                print(f"Browser cycle {cycle + 1} promo:", promo)
+
+                if promo:
+                    browser.close()
+                    return promo, status, final_html
+
+                # If WAF/challenge page, wait and reload once or twice
+                if is_challenge_page(final_html):
+                    page.wait_for_timeout(8000)
+                    try:
+                        response = page.reload(wait_until="domcontentloaded", timeout=60000)
+                        if response:
+                            status = response.status
+                        page.wait_for_timeout(8000)
+                    except PlaywrightTimeoutError:
+                        print("Reload timed out during WAF challenge handling.")
+                else:
+                    page.wait_for_timeout(5000)
+
+        except Exception as e:
+            print("Browser fetch failed:", e)
+
+        browser.close()
+        return None, status, final_html
 
 
 def fetch_promo_stable():
-    results = []
+    first, first_status, first_html = browser_fetch_once()
 
-    for i in range(3):
-        status, page = get_page()
-        promo = extract_from_html(page)
+    time.sleep(5)
 
-        print(f"Fetch {i+1} status:", status)
-        print(f"Fetch {i+1} promo:", promo)
+    second, second_status, second_html = browser_fetch_once()
 
-        results.append((status, promo, page[:500]))
+    print("First browser fetch:", first)
+    print("Second browser fetch:", second)
 
-        time.sleep(5)
+    # Prefer second result if it exists and changed after hydration
+    if second and second != first:
+        return second
 
-    promos = [p for _, p, _ in results if p]
+    if first:
+        return first
 
-    if promos:
-        # If multiple found, use the latest successful one
-        return promos[-1]
+    if second:
+        return second
 
-    # Debug failure
-    last_status, _, snippet = results[-1]
-    challenge_words = ["challenge", "captcha", "awswaf", "recaptcha", "access denied"]
-    challenge_detected = any(w in snippet.lower() for w in challenge_words)
+    final_html = second_html or first_html or ""
+    snippet = final_html[:900]
 
     send(
-        "⚠️ Could not find promo section.\n"
-        f"HTTP status: {last_status}\n"
-        f"Possible WAF/challenge page: {challenge_detected}\n"
-        f"Page snippet:\n```{snippet[:900]}```"
+        "⚠️ Could not find promo section after browser fetch.\n"
+        f"HTTP status: {second_status or first_status}\n"
+        f"Possible WAF/challenge page: {is_challenge_page(final_html)}\n"
+        f"Page snippet:\n```{snippet}```"
     )
 
     return None
 
 
+# -------------------------
+# PROMO BUG FIXES / DETECTION
+# -------------------------
 def fix_end_day_bug(text):
     today = datetime.now().strftime("%A").lower()
     return re.sub(f"ends {today}", "ends today", text, flags=re.IGNORECASE)
@@ -142,29 +231,45 @@ def extract_end_phrase(text):
 
 
 def gift_card_score(text):
-    text = text.lower()
+    t = text.lower()
     keywords = ["visa", "gift", "card", "prepaid", "reward", "bonus"]
-    return sum(1 for word in keywords if word in text)
+    return sum(1 for word in keywords if word in t)
 
 
 def is_gift_card_promo(text):
     t = text.lower()
     score = gift_card_score(t)
-    return "visa" in t or "gift card" in t or score >= 2
+
+    if "visa" in t:
+        return True
+
+    if "gift card" in t:
+        return True
+
+    if "prepaid card" in t:
+        return True
+
+    return score >= 2
 
 
+# -------------------------
+# STORAGE
+# -------------------------
 def load_last():
     if os.path.exists(LAST_FILE):
-        with open(LAST_FILE, "r") as f:
+        with open(LAST_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     return None
 
 
 def save_current(promo):
-    with open(LAST_FILE, "w") as f:
+    with open(LAST_FILE, "w", encoding="utf-8") as f:
         f.write(promo)
 
 
+# -------------------------
+# MAIN
+# -------------------------
 def main():
     promo = fetch_promo_stable()
 
@@ -175,9 +280,11 @@ def main():
     last_promo = load_last()
 
     print("Final promo:", promo)
+    print("Last promo:", last_promo)
 
     if promo != last_promo:
         end_info = extract_end_phrase(promo)
+
         send(f"🔄 Promo changed:\n{promo}\n\n📅 {end_info}")
 
         score = gift_card_score(promo)
